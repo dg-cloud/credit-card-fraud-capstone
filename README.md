@@ -1,21 +1,51 @@
 # Credit-card fraud capstone
 
-Standalone PH125.9x choose-your-own project using the Hugging Face dataset
-`pointe77/credit-card-transaction`.
+HarvardX PH125.9x "choose your own" capstone. Trains a fraud-screening model on
+the `pointe77/credit-card-transaction` Hugging Face dataset and turns the model
+score into a small, fraud-rich review queue. Full write-up is in
+`Credit_card_fraud_report.pdf`.
 
-## Workflow
+## Run it
+
+One command, end-to-end — downloads the CSVs, prepares features, fits and
+compares models, evaluates the held-out test set, and re-renders the PDF:
 
 ```sh
 CC_TRAIN_N=900000 CC_TEST_N=300000 Rscript credit_card_fraud_main.R
 ```
 
-The scripts keep the modeling workflow explicit:
+`CC_TRAIN_N` and `CC_TEST_N` cap the rows read from each CSV. Drop them or
+raise them well above file size to use the full data; expect proportionally
+longer runtime.
 
-- `credit_card_fraud_main.R`: main submission script; downloads data, prepares features, runs experiments, and renders the PDF.
-- `download_data.sh`: optional shell helper for downloading the dataset.
-- `prepare_credit_card_data.R`: reads the train/test CSVs and builds features.
-- `experiment_credit_card_models.R`: uses an internal train/validation split for model and threshold selection, then evaluates once on the held-out test rows.
-- `Credit_card_fraud_report.Rmd`: final report source.
-- `render_submit_pdf.R`: renders `Credit_card_fraud_report.pdf`.
+Prereqs: R 4.4+, `pandoc`, and a LaTeX engine (TinyTeX is the easiest path:
+`install.packages("tinytex"); tinytex::install_tinytex()`). Missing R packages
+are installed automatically by the entry script.
 
-The current sampled run selected `rf_base`, a seeded random forest, with a threshold chosen from validation predictions and then carried to the held-out test set. On the held-out test sample it achieved ROC-AUC near 0.99, PR-AUC near 0.82, precision near 0.83, recall near 0.74, and roughly 180x fraud concentration over the base rate. The top-1% alert rule captured more than 0.86 recall with lower precision, giving a clear operational tradeoff.
+## Result
+
+A seeded random forest (`rf_base`) using transaction amount, time of
+transaction, customer geography and demographics, and category. The threshold
+is picked on a held-out 25% validation slice of the training file and then
+carried unchanged to the held-out test set. On the test sample:
+
+- precision 0.83 at recall 0.74 (F1 0.78)
+- ROC-AUC 0.99, PR-AUC 0.82
+- alert queue is roughly 180x richer in fraud than the base transaction
+  stream (test-set fraud rate ≈ 0.0046)
+
+A wider top-1% rule on the same model gets recall above 0.86 at precision
+≈ 0.44. The report (§8) walks through the precision/recall tradeoff in
+detail and the example tables in §9 show what the model misses and why.
+
+## Files
+
+| File | Purpose |
+| --- | --- |
+| `credit_card_fraud_main.R` | Pipeline entry point — runs every stage in order |
+| `prepare_credit_card_data.R` | Feature engineering from the raw CSVs |
+| `experiment_credit_card_models.R` | Fits the model ladder, validates, scores test once |
+| `Credit_card_fraud_report.Rmd` | Report source (R Markdown → PDF) |
+| `render_submit_pdf.R` | Wraps `rmarkdown::render` with preflight checks |
+| `download_data.sh` | Standalone CSV downloader (also called by the entry point) |
+| `Credit_card_fraud_report.pdf` | Rendered report — the submission deliverable |
