@@ -83,7 +83,7 @@ cat(sprintf(
 ))
 ```
 
-As a *score*, the model ranks fraud well. ROC-AUC — the chance the model gives a random fraud transaction a higher score than a random non-fraud transaction — is `r round(final_results$roc_auc, 3)`. PR-AUC — average precision across all threshold choices, which equals the fraud base rate (about `r round(mean(cc_test$is_fraud), 5)`) for a ranker that scores at random — is `r round(final_results$pr_auc, 3)`, roughly `r round(final_results$pr_auc / mean(cc_test$is_fraud), 0)`× better than chance. Picking how aggressive the alert rule should be is an operational decision rather than a modeling one; §7 reports the same model under several alternative rules. Full definitions in §3.
+As a *score*, the model ranks fraud well. ROC-AUC — the chance the model gives a random fraud transaction a higher score than a random non-fraud transaction — is `r round(final_results$roc_auc, 3)`. PR-AUC — average precision across all threshold choices, which equals the fraud base rate (about `r round(mean(cc_test$is_fraud), 5)`) for a ranker that scores at random — is `r round(final_results$pr_auc, 3)`, roughly `r round(final_results$pr_auc / mean(cc_test$is_fraud), 0)`× better than chance. Picking how aggressive the alert rule should be is an operational decision rather than a modeling one; §8 reports the same model under several alternative rules. Full metric definitions in §3.
 
 # Data and Prediction Target
 
@@ -341,7 +341,7 @@ There is a clear threshold tradeoff. A top-0.5% rule is stricter and therefore h
 
 ```{r selection-comment, results = "asis"}
 if (best_selection$model == "rf_base") {
-  cat("One useful detail is that the encoded random forest did *not* win. I expected the identity-style encodings — merchant, card, job, category, and state rate features — to help, because repeated merchants and cards can carry history. In this run, the plain random forest using structured features did better on validation F1, so the final choice is the simpler model, picked on validation before the test set was touched.\n")
+  cat("One useful detail is that the encoded random forest did *not* win. I expected the identity-style encodings — merchant, card, job, category, and state rate features — to help, since repeated merchants and cards can carry history. The plain random forest using structured features ranked higher on validation F1 in this run, so the final pick is the simpler model.\n")
 } else if (best_selection$model == "rf_encoded") {
   cat("In this run, the encoded random forest came out ahead of the plain version. The identity/entity rate features for merchant, card, job, category, and state added enough signal on top of the structured features to justify the extra complexity. The selection was made on validation before the test set was touched.\n")
 } else {
@@ -401,7 +401,7 @@ The selected `r best_selection$rule` threshold flags `r final_results$flagged` t
 
 # Inspecting Individual Predictions
 
-Aggregate metrics are necessary, but they can make the model feel abstract. I also inspected individual test transactions to see what the alert queue actually looks like. The table below shows the highest-scored transactions in the test set.
+Aggregate metrics tell you the model works; individual transactions show *how* it works. The table below lists the twelve highest-scored test transactions — the rows that would sit at the top of an analyst's queue.
 
 ```{r top-alert-examples}
 format_examples(top_alert_examples) |>
@@ -417,7 +417,7 @@ format_examples(true_positive_examples) |>
   kable(booktabs = TRUE, caption = "Examples of fraud cases correctly placed in the alert queue")
 ```
 
-These examples show the model catching fraud across specific transaction contexts rather than merely repeating the base rate. They also help explain why an alert model can be useful even when it is not perfect: a small number of reviewed transactions contains many true fraud cases.
+The caught fraud cases span different categories, hours, and amounts — the model isn't pattern-matching on a single shortcut. They also illustrate the practical pitch of an alert system: a reviewer who only looks at this short list will encounter many real fraud cases.
 
 ## False Alerts and Missed Fraud
 
@@ -443,7 +443,7 @@ The examples in §9 sharpen this picture. The top alerts are not random low-doll
 
 A few methodological caveats apply to the metrics above:
 
-- **Sample size.** This report uses a sample of the provided files (see §12) rather than the full Hugging Face train and test sets. The workflow can be re-run at full scale by raising the `CC_TRAIN_N` and `CC_TEST_N` environment variables; the exact numbers will move slightly, but the model-progression pattern (amount → linear → non-linear) is robust.
+- **Sample size.** The report uses a sample of the provided files (see §12) rather than the full Hugging Face train and test sets. The workflow can be re-run at full scale by raising the `CC_TRAIN_N` and `CC_TEST_N` environment variables; the exact numbers will move, but the model-progression pattern (amount → linear → non-linear) holds across sample sizes I tested.
 - **In-fold target encoding.** The `glm_encoded` and `rf_encoded` variants use rate encodings computed from the same fold they train on. That is acceptable for an exploratory comparison, but production target encoding should be out-of-fold so each training row receives an encoding that was not built from its own label.
 ```{r encoding-caveat, results = "asis"}
 if (!grepl("encoded$", best_selection$model)) {
@@ -464,7 +464,7 @@ Three takeaways from this run:
 2. **Non-linearity, not richer features, drove the lift.** Adding identity/entity rate encodings on top of logistic regression produced only a modest gain, but switching to a random forest produced the largest single jump in validation F1.
 ```{r conclusion-takeaway-2, results = "asis"}
 if (best_selection$model == "rf_base") {
-  cat("The encoded random forest did not beat the plain one in this run; the simpler model won on its own merits before the test set was touched.\n")
+  cat("The encoded random forest did not beat the plain one in this run — the simpler model was the validation winner.\n")
 } else if (best_selection$model == "rf_encoded") {
   cat("The encoded random forest narrowly beat the plain one, suggesting that the identity/entity rates add some signal once the tree structure is in place.\n")
 } else {

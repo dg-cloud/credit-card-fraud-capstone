@@ -1,7 +1,6 @@
 # Downloaded data and generated artifacts
 data/*.csv
 cc_fraud_data.RData
-cc_fraud_models.RData
 cc_fraud_experiments.RData
 
 # R Markdown intermediates
@@ -10,3 +9,8 @@ cc_fraud_experiments.RData
 *.log
 *.aux
 *.out
+
+# macOS / editor cruft
+.DS_Store
+.Rhistory
+.Rproj.user/

@@ -1,17 +1,12 @@
-# Main submission script for the PH125.9x credit-card fraud capstone.
+# Single entry point for the PH125.9x credit-card fraud capstone — runs the
+# whole pipeline end-to-end. Splits into helper scripts so each stage is
+# inspectable on its own:
+#   1. download the Hugging Face train/test CSVs if not already on disk
+#   2. prepare_credit_card_data.R   — feature tables
+#   3. experiment_credit_card_models.R — fit, validate, score test once
+#   4. render_submit_pdf.R           — render the report (optional)
 #
-# This is the one script you can run to reproduce the workflow:
-#   1. download the public Hugging Face train/test CSV files if missing
-#   2. prepare the modeling feature tables
-#   3. fit/compare models and evaluate the held-out test set
-#   4. optionally render the PDF report
-#
-# The detailed implementation is kept in helper scripts for readability:
-#   - prepare_credit_card_data.R
-#   - experiment_credit_card_models.R
-#   - render_submit_pdf.R
-#
-# Example:
+# Examples:
 #   CC_TRAIN_N=900000 CC_TEST_N=300000 Rscript credit_card_fraud_main.R
 #   Rscript credit_card_fraud_main.R --skip-render
 #   Rscript credit_card_fraud_main.R --dry-run
