@@ -1,0 +1,12 @@
+# Downloaded data and generated artifacts
+data/*.csv
+cc_fraud_data.RData
+cc_fraud_models.RData
+cc_fraud_experiments.RData
+
+# R Markdown intermediates
+*.knit.md
+*.tex
+*.log
+*.aux
+*.out

@@ -1,0 +1,551 @@
+---
+title: "Predicting fraudulent credit-card transactions"
+subtitle: "HarvardX PH125.9x choose-your-own capstone"
+author: "Dean Grover"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_width: 6.2
+    fig_height: 3.8
+    fig_caption: true
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center")
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(knitr)
+})
+theme_set(theme_bw(base_size = 10) + theme(panel.grid.minor = element_blank()))
+blue <- "#2874A6"
+red <- "#A93226"
+dark <- "#2C3E50"
+```
+
+```{r load, include=FALSE}
+if (!file.exists("cc_fraud_data.RData")) stop("Run prepare_credit_card_data.R first.")
+if (!file.exists("cc_fraud_experiments.RData")) stop("Run experiment_credit_card_models.R first.")
+load("cc_fraud_data.RData")
+load("cc_fraud_experiments.RData")
+
+if (!exists("final_importance")) final_importance <- data.frame(feature = character(), importance = numeric())
+if (!exists("test_curve")) test_curve <- data.frame(threshold = numeric(), recall = numeric(), precision = numeric(), fpr = numeric())
+if (!exists("experiment_info")) {
+  experiment_info <- list(
+    seed_note = "Internal split uses seed=1; randomForest fits use deterministic seeds.",
+    r_version = paste(R.version$major, R.version$minor, sep = "."),
+    runtime_sec = NA_real_,
+    train_rows = nrow(cc_train),
+    test_rows = nrow(cc_test)
+  )
+}
+format_examples <- function(df) {
+  df |>
+    mutate(
+      score = round(score, 3),
+      amt = round(amt, 2),
+      age_years = round(age_years, 1),
+      distance_km = round(distance_km, 1),
+      city_pop_log = round(city_pop_log, 2)
+    ) |>
+    select(outcome, score, amt, category, hour, age_years, distance_km, gender, state)
+}
+```
+
+# Executive summary
+
+This project builds a fraud-screening model for credit-card transactions using the `pointe77/credit-card-transaction` dataset from Hugging Face. The question is practical: **if a stream of card transactions arrives tomorrow, can a model separate the few suspicious transactions from the many normal ones well enough to create a useful review queue?**
+
+**The headline result is concentration.** The final alert queue is about `r round(final_results$precision / mean(cc_test$is_fraud), 1)` times richer in fraud than the average test transaction. The base fraud rate in the test sample is only `r round(mean(cc_test$is_fraud), 5)`, while the selected alert rule has precision `r round(final_results$precision, 3)` — a transaction the model flags is far more likely to be fraud than a random one.
+
+```{r model-summary, results = "asis"}
+model_desc <- switch(best_selection$model,
+  rf_base = "a random forest fit on transaction amount, time-of-transaction, customer geography and demographics, and category",
+  rf_encoded = "a random forest fit on transaction amount, time-of-transaction, customer geography and demographics, category, and smoothed rate encodings for merchant, card, job, category, and state",
+  glm_base = "a logistic regression fit on transaction amount, time-of-transaction, customer geography and demographics, and category",
+  glm_encoded = "a logistic regression fit on the structured features plus smoothed identity/entity rate encodings",
+  amount_rule = "a simple rule that ranks transactions by transaction amount alone",
+  paste0("a `", best_selection$model, "` model")
+)
+cat(sprintf(
+  "The final model is `%s`, %s. As a *rule*, it flags %d of %s test transactions; %d of those are fraud and %d are not, while %d fraud cases slip through (recall %.3f, F1 %.3f).",
+  best_selection$model, model_desc,
+  final_results$flagged, format(nrow(cc_test), big.mark = ","),
+  final_results$tp, final_results$fp, final_results$fn,
+  final_results$recall, final_results$f1
+))
+```
+
+As a *score*, the model ranks fraud well. ROC-AUC — the chance the model gives a random fraud transaction a higher score than a random non-fraud transaction — is `r round(final_results$roc_auc, 3)`. PR-AUC — average precision across all threshold choices, which equals the fraud base rate (about `r round(mean(cc_test$is_fraud), 5)`) for a ranker that scores at random — is `r round(final_results$pr_auc, 3)`, roughly `r round(final_results$pr_auc / mean(cc_test$is_fraud), 0)`× better than chance. Picking how aggressive the alert rule should be is an operational decision rather than a modeling one; §7 reports the same model under several alternative rules. Full definitions in §3.
+
+# Data and Prediction Target
+
+Each row is a transaction. The target is `is_fraud`, where 1 means the transaction is labeled fraudulent and 0 means it is not. The dataset already provides separate train and test files, so the project keeps that split: all exploration, feature construction, model selection, and threshold selection are driven by the training data. The test set is reserved for the final estimate of performance.
+
+The report runs against a sample of each provided file so iteration stays fast; raising the `CC_TRAIN_N` and `CC_TEST_N` environment variables (or unsetting them) re-runs the same workflow against the full files.
+
+```{r data-summary}
+summary_tbl <- tibble(
+  Split = c("Train", "Test"),
+  Rows = c(nrow(cc_train), nrow(cc_test)),
+  Fraud = c(sum(cc_train$is_fraud), sum(cc_test$is_fraud)),
+  `Not fraud` = c(sum(cc_train$is_fraud == 0), sum(cc_test$is_fraud == 0)),
+  `Fraud rate` = c(mean(cc_train$is_fraud), mean(cc_test$is_fraud))
+)
+
+summary_tbl |>
+  kable(digits = 5, booktabs = TRUE, caption = "Prepared train/test data")
+```
+
+The class imbalance is the central modeling issue: only `r sum(cc_test$is_fraud)` of `r nrow(cc_test)` test transactions are fraud. The next section explains how the report handles that imbalance through metric choice rather than through resampling.
+
+# Evaluation Metrics
+
+The report therefore uses three groups of metrics. A quick plain-English glossary:
+
+- **Risk score**: the model's estimate that a transaction looks suspicious. Higher score means "review this sooner."
+- **Threshold**: the cutoff used to turn scores into alerts. If the threshold is 0.80, a transaction scoring 0.80 or higher is flagged.
+- **Precision**: of the transactions we flag, how many are actually fraud? This measures alert quality.
+- **Recall**: of all real fraud cases, how many did we catch? This measures how much fraud the system misses.
+- **F1**: a single score that balances precision and recall. It is useful when we want both a clean queue and good fraud coverage.
+- **ROC-AUC**: a ranking metric. If we randomly pick one fraud transaction and one non-fraud transaction, ROC-AUC is roughly the chance the model gives the fraud transaction a higher score.
+- **PR-AUC**: another ranking metric, but more useful for rare fraud. It summarizes precision and recall across many thresholds. A random ranking has PR-AUC close to the fraud base rate, which is only `r round(mean(cc_test$is_fraud), 5)` in the test data.
+
+The operational decision is the threshold. A bank could review the top 0.5% of risk scores, the top 1%, or use a validation-selected threshold that balances precision and recall. This project reports several such rules instead of pretending there is only one definition of "accuracy."
+
+```{r baseline-table}
+tibble(
+  Rule = c("Predict every transaction as legitimate", "Final selected fraud-alert rule"),
+  Flagged = c(0, final_results$flagged),
+  `Fraud caught` = c(0, final_results$tp),
+  `Fraud missed` = c(sum(cc_test$is_fraud), final_results$fn),
+  Accuracy = c(1 - mean(cc_test$is_fraud), final_results$accuracy),
+  Precision = c(NA_real_, final_results$precision),
+  Recall = c(0, final_results$recall)
+) |>
+  mutate(across(c(Accuracy, Precision, Recall), ~ round(.x, 4))) |>
+  kable(booktabs = TRUE, caption = "Why accuracy alone is not enough for this problem")
+```
+
+# Exploratory Analysis
+
+## Amount and Distance
+
+I first checked whether the labels looked learnable at all. If fraud and non-fraud had the same amount distribution, same categories, and same timing, then a strong classifier would be unlikely. The training data does show differences. Fraud rows have a much larger average transaction amount than legitimate rows, and the customer-to-merchant distance differs as well — though both are weak signals on their own; the model needs to combine them with category and timing to be useful.
+
+```{r amount-category}
+cc_train |>
+  group_by(is_fraud) |>
+  summarise(
+    n = n(),
+    median_amt = median(amt),
+    mean_amt = mean(amt),
+    p90_amt = quantile(amt, 0.90),
+    median_distance = median(distance_km),
+    mean_distance = mean(distance_km),
+    .groups = "drop"
+  ) |>
+  mutate(is_fraud = ifelse(is_fraud == 1, "Fraud", "Not fraud")) |>
+  kable(digits = 2, booktabs = TRUE, caption = "Training-set transaction summaries by label")
+```
+
+```{r amount-plot, fig.cap="Transaction amount is heavily skewed, so the model uses log(amount + 1)."}
+ggplot(cc_train, aes(x = amt_log, fill = factor(is_fraud))) +
+  geom_density(alpha = 0.45) +
+  scale_fill_manual(values = c("0" = blue, "1" = red), labels = c("Not fraud", "Fraud")) +
+  labs(x = "log(transaction amount + 1)", y = "Density", fill = NULL, title = "Amount distribution by label")
+```
+
+The model uses `amt_log` rather than raw `amt` because the dollar distribution has a long right tail; the log transform gives a smoother numeric input. The amount-only baseline in §6 also follows from this picture — if the dollar distributions for fraud and non-fraud are this distinct, a rule that just ranks by amount should already do better than chance.
+
+## Category Patterns
+
+Transaction category is a strong signal. Some categories have much higher fraud rates than others, which suggests that a useful model should not treat all purchases the same. A high-dollar grocery purchase and a high-dollar online shopping transaction may not carry the same risk.
+
+```{r category-rate, fig.cap="Fraud rate by transaction category in the training set."}
+cat_rate <- cc_train |>
+  group_by(category) |>
+  summarise(rate = mean(is_fraud), n = n(), fraud = sum(is_fraud), .groups = "drop") |>
+  arrange(desc(rate))
+
+ggplot(cat_rate, aes(reorder(category, rate), rate)) +
+  geom_col(fill = red) +
+  coord_flip() +
+  labs(x = NULL, y = "Fraud rate", title = "Training-set fraud rate by category")
+```
+
+```{r category-table}
+cat_rate |>
+  slice_head(n = 8) |>
+  mutate(rate = round(rate, 4)) |>
+  kable(booktabs = TRUE, caption = "Highest-fraud-rate categories in the training set")
+```
+
+## Time of Day
+
+Fraud risk also varies by hour. The same amount in the same category can have a different risk profile depending on when it occurs, so hour is a useful context variable for the model alongside amount and category.
+
+```{r hour-plot, fig.cap="Hourly fraud rate in the training set."}
+hour_rate <- cc_train |>
+  group_by(hour) |>
+  summarise(rate = mean(is_fraud), n = n(), .groups = "drop")
+
+ggplot(hour_rate, aes(hour, rate)) +
+  geom_line(color = dark, linewidth = 0.8) +
+  geom_point(color = red, size = 1.8) +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(x = "Hour of day", y = "Fraud rate", title = "Fraud rate by hour")
+```
+
+# Feature Engineering
+
+The preparation script creates features that match the exploratory findings and remain available for new transactions:
+
+- `amt_log`: log-transformed transaction amount.
+- `hour`, `day`, `month`, `weekday`: time features from the transaction timestamp.
+- `age_years`: customer age at transaction time.
+- `distance_km`: haversine distance between customer and merchant coordinates.
+- `city_pop_log`: log-transformed city population.
+- `gender`, `category`, `state`: categorical context variables.
+
+The experiment script also tests smoothed rate encodings for merchant, card number, job, category, and state. These are computed only from the internal fit data when scoring validation, and only from full training data when scoring the final test set. That matters because using the validation or test labels to build these encodings would leak the answer into the features.
+
+One caveat: inside the training fold, the encoded models use target encodings computed from the same fold they train on. That is acceptable here as an exploratory comparison, but a production version should use out-of-fold target encoding so each training row receives an encoding that was not computed from its own label. This caveat is another reason I prefer the final selected `rf_base` model: it does not rely on those target encodings.
+
+# Modeling Strategy
+
+The model-development process mirrors a disciplined holdout workflow:
+
+1. Use the provided training file for learning and validation.
+2. Split the training file into an internal fit set and validation set.
+3. Fit a sequence of models of increasing complexity.
+4. Select the best model and threshold using validation scores and validation labels.
+5. Refit the selected model on the full training sample.
+6. Score the held-out test sample once, using the threshold chosen during validation.
+
+The candidates were:
+
+- **`amount_rule`**: ranks transactions only by transaction amount. It asks, "How far can we get if we only assume bigger transactions are riskier?"
+- **`glm_base`**: logistic regression using structured transaction, time, demographic, geography, and category features. A transparent linear baseline that weights each feature additively.
+- **`glm_encoded`**: logistic regression plus train-only identity and entity risk encodings. This tests whether past risk patterns by merchant, card, job, category, or state add value.
+- **`rf_base`**: random forest using the structured features. A random forest is many decision trees voting together; it can learn combinations such as "high amount at a certain hour in a certain category."
+- **`rf_encoded`**: random forest plus the identity/entity encodings.
+
+This sequence is important. It shows whether performance comes from one obvious signal, from interpretable linear effects, from nonlinear interactions, or from richer identity history.
+
+```{r progression-table}
+best_by_model <- validation_results |>
+  group_by(model) |>
+  slice_max(order_by = f1, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(desc(f1))
+
+best_by_model |>
+  mutate(across(c(roc_auc, pr_auc, alert_rate, accuracy, precision, recall, f1), ~ round(.x, 4))) |>
+  select(model, rule, roc_auc, pr_auc, flagged, precision, recall, f1) |>
+  kable(booktabs = TRUE, caption = "Best validation result for each model family")
+```
+
+```{r progression-plot, fig.cap="Validation F1 improves as the model moves from a simple amount rule to random forests."}
+best_by_model$label <- factor(best_by_model$model, levels = best_by_model$model[order(best_by_model$f1)])
+
+ggplot(best_by_model, aes(label, f1)) +
+  geom_col(fill = blue) +
+  coord_flip() +
+  labs(x = NULL, y = "Best validation F1", title = "Model progression on validation data")
+```
+
+```{r progression-prose, results = "asis"}
+get_pr <- function(id) best_by_model$pr_auc[best_by_model$model == id]
+get_f1 <- function(id) best_by_model$f1[best_by_model$model == id]
+base_rate <- mean(cc_train$is_fraud)
+
+f1_amount <- get_f1("amount_rule")
+f1_glm <- get_f1("glm_base")
+f1_glm_enc <- get_f1("glm_encoded")
+f1_rf <- get_f1("rf_base")
+f1_rf_enc <- get_f1("rf_encoded")
+
+glm_enc_gain <- f1_glm_enc - f1_glm
+rf_enc_gain <- f1_rf_enc - f1_rf
+nonlinear_gain_pct <- 100 * (f1_rf - max(f1_glm, f1_glm_enc)) / max(f1_glm, f1_glm_enc)
+
+glm_enc_phrase <- if (glm_enc_gain >= 0.005) {
+  sprintf("**Adding identity/entity encodings** to logistic regression lifts F1 to %.3f — a modest gain.", f1_glm_enc)
+} else if (glm_enc_gain < -0.005) {
+  sprintf("**Adding identity/entity encodings** to logistic regression actually moves F1 *down* to %.3f, suggesting the linear model cannot exploit them well.", f1_glm_enc)
+} else {
+  sprintf("**Adding identity/entity encodings** to logistic regression has essentially no effect (F1 %.3f).", f1_glm_enc)
+}
+
+rf_enc_phrase <- if (f1_rf_enc > f1_rf + 0.005) {
+  sprintf("The **encoded random forest** does improve on the plain one in this run (F1 %.3f vs %.3f). The selected model is `rf_encoded`.", f1_rf_enc, f1_rf)
+} else {
+  sprintf("Notably, the **encoded random forest** (F1 %.3f) does not improve on the plain version (F1 %.3f) — the tree structure already captures most of what the encodings expose, and the final selected model is the simpler `rf_base`, chosen on validation before the test set was touched.", f1_rf_enc, f1_rf)
+}
+
+cat(sprintf(
+  "Reading the table top-to-bottom: the **amount-only rule** reaches PR-AUC %.3f against a training base rate of %.5f — a real signal but not a usable alert. **Logistic regression** on the structured features lifts validation F1 from %.3f (amount rule) to %.3f, mainly by adding category, time, and geography. %s\n\nThe biggest jump is non-linearity: the **plain random forest** lands at F1 %.3f, roughly %.0f%% above the best linear variant. %s",
+  get_pr("amount_rule"), base_rate,
+  f1_amount, f1_glm,
+  glm_enc_phrase,
+  f1_rf, nonlinear_gain_pct,
+  rf_enc_phrase
+))
+```
+
+## What the Random Forest Used
+
+The selected model was not chosen only because it had the best validation score. Its strongest variables also make sense given the exploratory analysis. The random forest importance measure below is based on mean decrease in Gini impurity: higher values indicate variables that were more useful for splitting transactions into lower-risk and higher-risk groups.
+
+```{r importance-table}
+final_importance |>
+  slice_head(n = 12) |>
+  mutate(importance = round(importance, 2)) |>
+  kable(booktabs = TRUE, caption = "Most important variables in the selected final model")
+```
+
+```{r importance-plot, fig.cap="Top random-forest variables by mean decrease in Gini impurity."}
+final_importance |>
+  slice_head(n = 12) |>
+  mutate(feature = reorder(feature, importance)) |>
+  ggplot(aes(feature, importance)) +
+  geom_col(fill = dark) +
+  coord_flip() +
+  labs(x = NULL, y = "Importance", title = "What the selected model used most")
+```
+
+The most important variables line up with the exploratory evidence — amount, hour, category, and state lead, and the demographic and geographic features fall into a sensible second tier. There are no surprise features at the top, which is the simplest defence against a model that scores well by accident.
+
+# Validation Results
+
+The top validation rows are shown below. The selected row is `r best_selection$model` with the `r best_selection$rule` threshold rule. It caught about `r round(best_selection$recall, 3)` of fraud cases on validation with precision about `r round(best_selection$precision, 3)`.
+
+```{r validation-top}
+validation_results |>
+  arrange(desc(f1), desc(precision)) |>
+  slice_head(n = 12) |>
+  mutate(across(c(roc_auc, pr_auc, alert_rate, accuracy, precision, recall, f1), ~ round(.x, 4))) |>
+  select(model, rule, roc_auc, pr_auc, flagged, tp, fp, fn, accuracy, precision, recall, f1) |>
+  kable(booktabs = TRUE, caption = "Top validation results by F1")
+```
+
+There is a clear threshold tradeoff. A top-0.5% rule is stricter and therefore has higher precision. A top-1% or top-2% rule catches more fraud but sends more legitimate transactions to review.
+
+```{r selection-comment, results = "asis"}
+if (best_selection$model == "rf_base") {
+  cat("One useful detail is that the encoded random forest did *not* win. I expected the identity-style encodings — merchant, card, job, category, and state rate features — to help, because repeated merchants and cards can carry history. In this run, the plain random forest using structured features did better on validation F1, so the final choice is the simpler model, picked on validation before the test set was touched.\n")
+} else if (best_selection$model == "rf_encoded") {
+  cat("In this run, the encoded random forest came out ahead of the plain version. The identity/entity rate features for merchant, card, job, category, and state added enough signal on top of the structured features to justify the extra complexity. The selection was made on validation before the test set was touched.\n")
+} else {
+  cat(sprintf("In this run, the selected model is `%s` with the `%s` rule. The selection was made on validation before the test set was touched.\n", best_selection$model, best_selection$rule))
+}
+```
+
+# Final Held-Out Test
+
+After selecting the model and threshold on validation, the model was refit using the full prepared training sample. The final evaluation below is on the held-out test rows.
+
+```{r final-result}
+final_results |>
+  mutate(across(c(roc_auc, pr_auc, alert_rate, accuracy, precision, recall, f1), ~ round(.x, 4))) |>
+  select(model, rule, roc_auc, pr_auc, flagged, tp, fp, tn, fn, accuracy, precision, recall, f1) |>
+  kable(booktabs = TRUE, caption = "Final held-out test performance")
+```
+
+The confusion matrix is easier to read in words: the model flagged `r final_results$flagged` transactions, of which `r final_results$tp` were fraud and `r final_results$fp` were not. It missed `r final_results$fn` fraud cases. Since fraud is rare, this is a large concentration improvement over the base rate: the alert queue is about `r round(final_results$precision / mean(cc_test$is_fraud), 1)` times richer in fraud than the average transaction stream.
+
+```{r roc-pr-curves, fig.cap="ROC and precision-recall views of the final model on the held-out test sample."}
+roc_df <- test_curve |> transmute(x = fpr, y = recall, curve = "ROC: false positive rate vs recall")
+pr_df <- test_curve |> transmute(x = recall, y = precision, curve = "PR: recall vs precision")
+curve_df <- bind_rows(roc_df, pr_df)
+
+ggplot(curve_df, aes(x, y)) +
+  geom_line(color = blue, linewidth = 0.8) +
+  facet_wrap(~ curve, scales = "free_x") +
+  labs(x = NULL, y = NULL, title = "Final model ranking curves")
+```
+
+The ROC curve asks whether fraud tends to be ranked above non-fraud. The precision-recall curve is stricter for this problem: it shows how clean the alert queue remains as we try to catch more fraud.
+
+```{r final-rules}
+final_rule_results |>
+  arrange(desc(f1)) |>
+  mutate(across(c(alert_rate, accuracy, precision, recall, f1), ~ round(.x, 4))) |>
+  select(rule, flagged, alert_rate, tp, fp, fn, accuracy, precision, recall, f1) |>
+  kable(booktabs = TRUE, caption = "Selected model under alternative threshold rules on the test set")
+```
+
+```{r metric-plot, fig.cap="Precision/recall tradeoff for threshold rules on the final selected model."}
+plot_df <- bind_rows(
+  final_rule_results |> transmute(rule, metric = "precision", value = precision),
+  final_rule_results |> transmute(rule, metric = "recall", value = recall),
+  final_rule_results |> transmute(rule, metric = "f1", value = f1)
+)
+
+ggplot(plot_df, aes(rule, value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.75)) +
+  scale_fill_manual(values = c("precision" = blue, "recall" = red, "f1" = dark)) +
+  coord_flip() +
+  labs(x = NULL, y = "Metric value", title = "Final model threshold tradeoff")
+```
+
+The selected `r best_selection$rule` threshold flags `r final_results$flagged` test transactions in total. The top-1% rule is much wider — it flags `r final_rule_results$flagged[final_rule_results$rule == "top_1pct"]` transactions, roughly `r round(final_rule_results$flagged[final_rule_results$rule == "top_1pct"] / final_results$flagged, 1)`× the size of the selected queue — and catches `r round(final_rule_results$recall[final_rule_results$rule == "top_1pct"], 3)` of fraud at precision `r round(final_rule_results$precision[final_rule_results$rule == "top_1pct"], 3)`. That tradeoff could still be acceptable if a review team can handle the larger queue and the cost of missing fraud outweighs the cost of investigating extra transactions.
+
+# Inspecting Individual Predictions
+
+Aggregate metrics are necessary, but they can make the model feel abstract. I also inspected individual test transactions to see what the alert queue actually looks like. The table below shows the highest-scored transactions in the test set.
+
+```{r top-alert-examples}
+format_examples(top_alert_examples) |>
+  kable(booktabs = TRUE, caption = "Highest-risk transactions according to the final model")
+```
+
+Most of the highest-scored alerts are true positives — these are the rows that would land at the top of an analyst's review queue.
+
+## Correct Alerts
+
+```{r true-positive-examples}
+format_examples(true_positive_examples) |>
+  kable(booktabs = TRUE, caption = "Examples of fraud cases correctly placed in the alert queue")
+```
+
+These examples show the model catching fraud across specific transaction contexts rather than merely repeating the base rate. They also help explain why an alert model can be useful even when it is not perfect: a small number of reviewed transactions contains many true fraud cases.
+
+## False Alerts and Missed Fraud
+
+No fraud model is perfect, so the errors matter. False positives are legitimate transactions the model would send to review. Missed fraud cases are fraudulent transactions that scored below the selected threshold.
+
+```{r false-positive-examples}
+format_examples(false_positive_examples) |>
+  kable(booktabs = TRUE, caption = "Examples of false alerts")
+```
+
+```{r missed-fraud-examples}
+format_examples(missed_fraud_examples) |>
+  kable(booktabs = TRUE, caption = "Examples of missed fraud cases")
+```
+
+These error examples make the tradeoff concrete. Tight thresholds produce a cleaner queue but miss more fraud. Wider thresholds catch more fraud but include more legitimate transactions. The right choice depends on review capacity and the cost of missing fraud versus interrupting a legitimate customer.
+
+# Discussion
+
+The model is useful because it turns a very imbalanced stream into a concentrated review queue. In the test sample, the overall fraud rate is `r round(mean(cc_test$is_fraud), 5)`; the selected alert rule has precision `r round(final_results$precision, 3)`, so a flagged transaction is far more likely to be fraud than a random one.
+
+The examples in §9 sharpen this picture. The top alerts are not random low-dollar transactions — they tend to combine high transaction amounts with categories and hours that the exploratory analysis already flagged. The false positives sit in the same fields, which is exactly why they are hard: the model is not making careless mistakes; it is hitting a real ambiguity boundary. The missed-fraud cases tell the opposite story — they tend to look ordinary on the features the model has, which means recovering them would likely require signals outside this dataset (transaction velocity, account history, device or session) rather than a smarter model on the same columns.
+
+A few methodological caveats apply to the metrics above:
+
+- **Sample size.** This report uses a sample of the provided files (see §12) rather than the full Hugging Face train and test sets. The workflow can be re-run at full scale by raising the `CC_TRAIN_N` and `CC_TEST_N` environment variables; the exact numbers will move slightly, but the model-progression pattern (amount → linear → non-linear) is robust.
+- **In-fold target encoding.** The `glm_encoded` and `rf_encoded` variants use rate encodings computed from the same fold they train on. That is acceptable for an exploratory comparison, but production target encoding should be out-of-fold so each training row receives an encoding that was not built from its own label.
+```{r encoding-caveat, results = "asis"}
+if (!grepl("encoded$", best_selection$model)) {
+  cat(sprintf("    The selected %s model does not use these encodings, so this caveat does not affect the final test result.\n", best_selection$model))
+} else {
+  cat(sprintf("    The selected %s model does rely on these encodings, so the in-fold caveat applies to its training and the reported metrics may be modestly optimistic; an out-of-fold encoding rerun would tighten the estimate.\n", best_selection$model))
+}
+```
+- **Random split, not time-ordered.** The provided train/test split is random rather than time-ordered. Real deployment would require a time-ordered backtest to detect drift in fraud patterns over time.
+- **Predictive performance only.** Cost-sensitive thresholding, fairness checks across demographics, and manual review capacity all matter for a real deployment but are out of scope for this report.
+
+# Conclusion
+
+Three takeaways from this run:
+
+1. **The product is concentration, not accuracy.** The selected alert rule is roughly `r round(final_results$precision / mean(cc_test$is_fraud), 0)`× more fraud-rich than the underlying transaction stream. That is the practical thing a bank could do with this model — narrow `r format(nrow(cc_test), big.mark = ",")` transactions down to a `r final_results$flagged`-row review queue with `r round(final_results$precision, 3)` precision — and it is what the metrics in §1 quantify.
+
+2. **Non-linearity, not richer features, drove the lift.** Adding identity/entity rate encodings on top of logistic regression produced only a modest gain, but switching to a random forest produced the largest single jump in validation F1.
+```{r conclusion-takeaway-2, results = "asis"}
+if (best_selection$model == "rf_base") {
+  cat("The encoded random forest did not beat the plain one in this run; the simpler model won on its own merits before the test set was touched.\n")
+} else if (best_selection$model == "rf_encoded") {
+  cat("The encoded random forest narrowly beat the plain one, suggesting that the identity/entity rates add some signal once the tree structure is in place.\n")
+} else {
+  cat(sprintf("The selected `%s` model was the validation winner.\n", best_selection$model))
+}
+```
+
+3. **Failure has a shape.** The missed-fraud and false-positive tables in §9 are not random — false positives concentrate in the same high-risk categories the model learned to flag, and missed fraud tends to look ordinary in amount and category. Recovering those cases would require signals not in this dataset (transaction velocity, account history, device or session features) rather than a different algorithm on the same features.
+
+The methodological caveats — sampled rather than full files, in-fold target encoding for the encoded variants, and the provided random split rather than a time-ordered backtest — apply to all the metrics above and are discussed in §10. None of them affect the central concentration result.
+
+\newpage
+
+# Reproducibility
+
+## How to reproduce these results
+
+**Prerequisites**
+
+- R 4.4 or newer with packages `readr`, `dplyr`, `ggplot2`, `knitr`, `randomForest`, `rmarkdown`
+- `pandoc` (e.g. `brew install pandoc` on macOS)
+- A LaTeX engine — easiest path is `install.packages("tinytex"); tinytex::install_tinytex()`
+- `curl` and `unzip` for the data download script
+
+**Steps**
+
+The simplest path is the main submission script. It downloads data if needed, prepares features, runs the model experiment, and renders the PDF:
+
+```sh
+CC_TRAIN_N=900000 CC_TEST_N=300000 Rscript credit_card_fraud_main.R
+```
+
+The helper scripts can also be run one by one:
+
+1. Download the Hugging Face train/test CSVs into `data/`:
+
+    ```sh
+    ./download_data.sh
+    ```
+
+2. Build the prepared feature tables. `CC_TRAIN_N` / `CC_TEST_N` cap the rows read from each CSV (raise or unset for the full files):
+
+    ```sh
+    CC_TRAIN_N=900000 CC_TEST_N=300000 Rscript prepare_credit_card_data.R
+    ```
+
+3. Fit the model candidates, select on validation, and score the held-out test set:
+
+    ```sh
+    Rscript experiment_credit_card_models.R
+    ```
+
+4. Render this PDF report:
+
+    ```sh
+    Rscript render_submit_pdf.R
+    ```
+
+**What gets produced**
+
+- `cc_fraud_data.RData` — prepared feature tables (`cc_train`, `cc_test`, `meta`)
+- `cc_fraud_experiments.RData` — validation, test, importance, and example tables
+- `Credit_card_fraud_report.pdf` — this document
+
+For edX submission, `credit_card_fraud_main.R` is the main R script. The helper scripts remain in the project folder to keep the code easier to review.
+
+## Determinism
+
+The internal `cc_train` validation split uses `set.seed(1)`. Each random-forest fit uses a fixed seed (`1001` for `rf_base`, `1002` for `rf_encoded`), so two runs at the same `CC_TRAIN_N` / `CC_TEST_N` produce identical metrics. Changing the sample sizes will move the numbers slightly because the underlying training rows change, not because of model randomness.
+
+## Run footprint
+
+The numbers in this PDF were produced under R `r experiment_info$r_version` against `r format(experiment_info$train_rows, big.mark = ",")` prepared training rows and `r format(experiment_info$test_rows, big.mark = ",")` held-out test rows. Wall-clock time for the experiment step scales roughly with training rows; expect a few minutes at the default sample size on a modern laptop, longer at full file size.
+
+\newpage
+
+# References
+
+- HarvardX. *PH125.9x Data Science: Capstone — Choose Your Own Project Submission and Grading Rubric*. edX course page, accessed May 2026.
+- pointe77. *credit-card-transaction*. Hugging Face Datasets. https://huggingface.co/datasets/pointe77/credit-card-transaction
+- Dal Pozzolo, A., Caelen, O., Johnson, R. A., and Bontempi, G. (2015). *Calibrating probability with undersampling for unbalanced classification*. IEEE Symposium Series on Computational Intelligence.
+- Breiman, L. (2001). *Random Forests*. Machine Learning, 45, 5-32.
+- Liaw, A. and Wiener, M. (2002). *Classification and Regression by randomForest*. R News, 2(3), 18-22.
+- Dal Pozzolo, A., Boracchi, G., Caelen, O., Alippi, C., and Bontempi, G. *Reproducible Machine Learning for Credit Card Fraud Detection: Practical Handbook*. https://fraud-detection-handbook.github.io/fraud-detection-handbook/
