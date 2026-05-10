@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
-# Download the train/test CSVs from the pointe77/credit-card-transaction
-# dataset on Hugging Face into ./data/. Idempotent: skips files that already
-# exist, so re-running after a partial download is safe.
+# Optional shell helper to grab the train and test CSVs from Hugging Face
+# into ./data/. credit_card_fraud_main.R does this in R already, so this
+# script is only here for people who would rather download outside R.
+# Idempotent. If a file already exists it is skipped.
 
 set -euo pipefail
 
-# Always run from the script's directory so the data/ path is correct
-# regardless of the caller's working directory.
+# Always run from the script's own folder so the data/ path is correct
+# regardless of where I call it from.
 cd "$(dirname "$0")"
 mkdir -p data
 
 base="https://huggingface.co/datasets/pointe77/credit-card-transaction/resolve/main"
 
-# --fail makes curl exit non-zero on HTTP errors (otherwise it would silently
-# write an HTML error page into the CSV file). --retry handles transient
-# network blips. -L follows redirects (HF uses CDN redirects).
+# --fail makes curl exit with an error on HTTP errors. Without it curl would
+# happily write an HTML error page into the CSV and confuse the next step.
+# --retry handles the occasional flaky connection. -L follows redirects, which
+# the Hugging Face CDN uses.
 if [ ! -f data/credit_card_transaction_train.csv ]; then
   curl -L --fail --retry 3 -o data/credit_card_transaction_train.csv "$base/credit_card_transaction_train.csv"
 fi
